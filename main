@@ -1,0 +1,158 @@
+-- RAT PATCH v3 — auto-learn, shape-lock, cache-warm, channel sniff
+-- tidak ada bendera LEARN_MODE lagi. belajar sekali, patch seterusnya.
+local player = game.Players.LocalPlayer
+
+local SNIFF_CHANNELS = true   -- cetak atribut / value kanal state alternatif
+local WARM_CACHE = true       -- paksa satu request sendiri setelah target terkunci
+
+local target = nil
+local learnedArgs = nil
+local patchCount = 0
+
+local GATE_KEYS = {
+    allowed = true, enabled = true, visible = true, access = true,
+    isadmin = true, admin = true, canaccesspanel = true,
+    reserved = true, active = true, unlocked = true,
+}
+local LOCK_KEYS = { locked = true }
+local SHAPE_KEYS = { commands = true, state = true, permissions = true, role = true, level = true }
+
+local function fullName(self)
+    if typeof(self) ~= "Instance" then return nil end
+    local ok, n = pcall(function() return self:GetFullName() end)
+    return ok and n or nil
+end
+
+local function dump(v, depth)
+    depth = depth or 0
+    if depth > 3 then return "..." end
+    if type(v) ~= "table" then return tostring(v) end
+    local parts = {}
+    for k, val in pairs(v) do
+        if #parts < 40 then
+            parts[#parts + 1] = tostring(k) .. "=" .. dump(val, depth + 1)
+        end
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local function looksLikeState(t)
+    if type(t) ~= "table" then return false end
+    for k in pairs(t) do
+        if SHAPE_KEYS[tostring(k):lower()] then return true end
+    end
+    return type(t.State) == "table" or type(t.state) == "table"
+end
+
+local function patchGates(resp, seen)
+    if type(resp) ~= "table" then return resp end
+    seen = seen or {}
+    if seen[resp] then return resp end
+    seen[resp] = true
+    for k, v in pairs(resp) do
+        local lk = tostring(k):lower()
+        if GATE_KEYS[lk] then
+            resp[k] = true
+        elseif LOCK_KEYS[lk] then
+            resp[k] = false
+        elseif type(v) == "table" then
+            patchGates(v, seen)
+        end
+    end
+    return resp
+end
+
+local old_namecall
+old_namecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+    local method = getnamecallmethod()
+    if method ~= "InvokeServer" and method ~= "FireServer" then
+        return old_namecall(self, ...)
+    end
+
+    local name = fullName(self)
+    if not name then return old_namecall(self, ...) end
+    local low = name:lower()
+
+    if target == nil then
+        local nameHit = (low:find("contentcreator") or low:find("creator") or low:find("admin"))
+                        and low:find("request")
+        if nameHit then
+            target = self
+            warn("[RAT] target terkunci (nama):", name)
+        end
+    end
+
+    if self == target then
+        if learnedArgs == nil then
+            learnedArgs = table.pack(...)
+            local resp = table.pack(old_namecall(self, ...))
+            warn("[RAT][LEARN] args:", dump(learnedArgs))
+            warn("[RAT][LEARN] resp:", dump(resp))
+            if not looksLikeState(resp[1]) then
+                warn("[RAT] respons bukan shape state — target mungkin salah")
+            end
+            return table.unpack(resp, 1, resp.n)
+        end
+        patchCount = patchCount + 1
+        if patchCount <= 20 or patchCount % 10 == 0 then
+            warn(("[RAT] patch applied #%d"):format(patchCount))
+        end
+        local resp = table.pack(old_namecall(self, ...))
+        for i = 1, resp.n do resp[i] = patchGates(resp[i]) end
+        return table.unpack(resp, 1, resp.n)
+    end
+
+    if target == nil and method == "InvokeServer" then
+        local probe = table.pack(old_namecall(self, ...))
+        if looksLikeState(probe[1]) then
+            target = self
+            learnedArgs = table.pack(...)
+            warn("[RAT] target terkunci (shape):", name)
+            warn("[RAT][LEARN] resp:", dump(probe))
+        end
+        return table.unpack(probe, 1, probe.n)
+    end
+
+    if not low:find("probe") and not low:find("awayearnings")
+       and not low:find("analytics") and not low:find("ping")
+       and not low:find("rigsync") then
+        warn("[REMOTE]", method, name, "|", dump(table.pack(...)))
+    end
+
+    return old_namecall(self, ...)
+end))
+
+if WARM_CACHE then
+    task.delay(3, function()
+        if target and learnedArgs then
+            warn("[RAT] warming cache: satu request paksa")
+            pcall(function()
+                target:InvokeServer(table.unpack(learnedArgs, 1, learnedArgs.n))
+            end)
+        else
+            warn("[RAT] warm skip: target atau args belum tertangkap")
+        end
+    end)
+end
+
+if SNIFF_CHANNELS then
+    task.spawn(function()
+        local attrs = player:GetAttributes()
+        if next(attrs) then warn("[RAT][ATTR] player: " .. dump(attrs)) end
+        player.AttributeChanged:Connect(function()
+            warn("[RAT][ATTR*] player: " .. dump(player:GetAttributes()))
+        end)
+        for _, root in ipairs({ game:GetService("ReplicatedStorage"), game:GetService("ReplicatedFirst"), player }) do
+            for _, inst in ipairs(root:GetDescendants()) do
+                local lk = inst.Name:lower()
+                if (inst:IsA("ValueBase") or inst:IsA("Folder"))
+                   and (lk:find("admin") or lk:find("perm") or lk:find("rank") or lk:find("creator")) then
+                    warn("[RAT][CHAN] ketemu:", inst:GetFullName())
+                end
+            end
+        end
+    end)
+end
+
+print("[RAT] v3 loaded. tunggu 'target terkunci', lalu BUKA panel.")
+print("[RAT] server hop = execute ulang, atau taruh script di autoexec.")
